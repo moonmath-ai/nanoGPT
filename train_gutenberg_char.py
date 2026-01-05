@@ -28,19 +28,18 @@ from GPT import GPTConfig, GPT
 dataset = 'gutenberg_char'
 gradient_accumulation_steps = 1
 batch_size = 64
-fixed_input_len = 512  # If set, use this fixed input length instead of random
+input_len = 32  # Input sequence length
 loss_last_only = False  # If True, compute loss only on the last token position
 
 # Model parameters
-max_input_len = 1024
 n_embd = 384
 n_head = 6
 n_layer = 8
 dropout = 0.2
 has_bias = False
 init_std = 0.02
-use_rope = True
-q_len = 32
+q_len = 32  # If None, uses input_len (no compression)
+assert q_len is None or q_len <= input_len, f"q_len ({q_len}) must be <= input_len ({input_len})"
 
 # I/O
 out_dir = 'out_gutenberg_char'
@@ -52,7 +51,7 @@ always_save_checkpoint = False
 init_from = 'scratch'  # 'scratch' or 'resume'
 wandb_log = True
 wandb_project = 'gutenberg-char'
-wandb_run_name = f'gpt-gutenberg-char-{fixed_input_len}to{q_len}'
+wandb_run_name = f'gpt-gutenberg-char-{input_len}to{q_len}'
 
 # AdamW optimizer
 learning_rate = 1e-3
@@ -120,14 +119,10 @@ def get_batch():
     """
     Get a batch of training data for standard next-token prediction.
     
-    - If fixed_input_len is set, use that; otherwise randomize from 1 to max_input_len
     - Randomizes starting positions in the dataset
-    - Input: sequence of length T
+    - Input: sequence of length input_len
     - Target: input shifted by 1 (next token for each position)
     """
-    # Use fixed input length if set, otherwise randomize
-    input_len = fixed_input_len if fixed_input_len is not None else torch.randint(1, max_input_len + 1, (1,)).item()
-    
     # Ensure we have room for input_len + 1 (need one extra for target shift)
     max_start = data_len - input_len - 1
     if max_start <= 0:
@@ -175,14 +170,12 @@ else:
 # Model init
 model_args = dict(
     vocab_cardinality=vocab_cardinality,
-    max_input_len=max_input_len,
     n_embd=n_embd,
     n_head=n_head,
     n_layer=n_layer,
     has_bias=has_bias,
     init_std=init_std,
     dropout=dropout,
-    use_rope=use_rope,
     q_len=q_len,
 )
 
@@ -196,7 +189,7 @@ elif init_from == 'resume':
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # Force config attributes to match checkpoint
-    for k in ['vocab_cardinality', 'max_input_len', 'n_embd', 'n_head', 'n_layer', 'has_bias', 'use_rope', 'q_len']:
+    for k in ['vocab_cardinality', 'n_embd', 'n_head', 'n_layer', 'has_bias', 'q_len']:
         model_args[k] = checkpoint_model_args[k]
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -366,8 +359,7 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5:
-            T = fixed_input_len if fixed_input_len is not None else max_input_len
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt, T)
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt, input_len)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     

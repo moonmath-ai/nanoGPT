@@ -38,8 +38,8 @@ class Attention(nn.Module):
                 - n_head: Number of attention heads
                 - has_bias: Whether to use bias in layers
                 - dropout: Dropout rate
-                - q_len: Query length (for trunc_self_attn and latent_attn modes, required)
-                - init_std: Standard deviation for latent init (for latent_attn mode, required)
+                - latent_q_len: Query length (for latent_attn mode only, required)
+                - latent_init_std: Standard deviation for latent init (for latent_attn mode only, required)
             attn_type: Type of attention ('full_self_attn', 'causal_self_attn', 'cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn', or 'latent_attn')
         """
         super().__init__()
@@ -53,16 +53,13 @@ class Attention(nn.Module):
         # Layer normalization for pre-norm architecture
         self.ln = LayerNorm(config.n_embd, has_bias=config.has_bias)
         
-        # Validate q_len for modes that require it
-        if attn_type in ['trunc_self_attn', 'causal_trunc_self_attn', 'latent_attn']:
-            assert hasattr(config, 'q_len'), "config must have 'q_len' for trunc_self_attn, causal_trunc_self_attn, or latent_attn mode"
-
         # Query projection or learned latent
         if attn_type in ['full_self_attn', 'causal_self_attn', 'cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn']:
             self.c_q = nn.Linear(config.n_embd, config.n_embd, bias=config.has_bias)
         else:  # latent_attn
-            assert hasattr(config, 'init_std'), "config must have 'init_std' for latent_attn mode"
-            self.c_q = nn.Parameter(torch.randn(1, config.q_len, config.n_embd) * config.init_std)
+            assert hasattr(config, 'latent_q_len'), "config must have 'latent_q_len' for latent_attn mode"
+            assert hasattr(config, 'latent_init_std'), "config must have 'latent_init_std' for latent_attn mode"
+            self.c_q = nn.Parameter(torch.randn(1, config.latent_q_len, config.n_embd) * config.latent_init_std)
         
         # Key, value, and output projections
         self.c_k = nn.Linear(config.n_embd, config.n_embd, bias=config.has_bias)
@@ -75,9 +72,9 @@ class Attention(nn.Module):
         # Store config values
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.q_len = getattr(config, 'q_len', None)
         self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
+        self.latent_q_len = config.latent_q_len if attn_type == 'latent_attn' else None
         
         # Require flash attention (PyTorch >= 2.0)
         if not hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
@@ -147,7 +144,7 @@ class Attention(nn.Module):
         
         return x_out.type_as(x)
     
-    def forward(self, x: torch.Tensor, y: Optional[torch.Tensor] = None, rope_start_idx: Optional[int] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, q_len: Optional[int] = None, y: Optional[torch.Tensor] = None, rope_start_idx: Optional[int] = None) -> torch.Tensor:
         """
         Forward pass through attention with RoPE, LayerNorm, and residual connection.
         
@@ -155,15 +152,16 @@ class Attention(nn.Module):
             x: (B, T, n_embd) input tensor
                 - For full/causal_self_attn: used for q, k, v
                 - For cross_attn: used for q only
-                - For trunc_self_attn: last q_len positions used for q, full x for k, v
+                - For trunc_self_attn/causal_trunc_self_attn: last q_len positions used for q, full x for k, v
                 - For latent_attn: used for k, v only
+            q_len: Output length for trunc_self_attn/causal_trunc_self_attn (required for those modes)
             y: (B, S, n_embd) tensor for cross_attn (k, v source), required for cross_attn
             rope_start_idx: Starting position index for RoPE (default None, skips RoPE if None)
             
         Returns:
             Output tensor: (B, T, n_embd) for full/causal_self_attn and cross_attn, (B, q_len, n_embd) for trunc_self_attn, causal_trunc_self_attn, and latent_attn
         """
-        B, T, n_embd = x.size()  # batch, sequence length, embedding dim
+        B, kv_len, n_embd = x.size()  # batch, sequence length, embedding dim
         assert n_embd == self.n_embd, "Input embedding dimension must match model dimension"
         
         # Validate y for cross_attn
@@ -171,35 +169,40 @@ class Attention(nn.Module):
             assert y is not None, "y is required for cross_attn mode"
             assert y.size(2) == self.n_embd, "y embedding dimension must match model dimension"
         
+        # Validate q_len for trunc modes
+        if self.attn_type in ['trunc_self_attn', 'causal_trunc_self_attn']:
+            assert q_len is not None, "q_len is required for trunc_self_attn/causal_trunc_self_attn mode"
+            assert q_len <= kv_len, f"q_len ({q_len}) must be <= kv_len ({kv_len})"
+        
         # Store residual for pre-norm architecture
         if self.attn_type in ['full_self_attn', 'causal_self_attn', 'cross_attn']:
-            residual = x  # (B, T, n_embd)
+            residual = x  # (B, kv_len, n_embd)
         elif self.attn_type in ['trunc_self_attn', 'causal_trunc_self_attn']:
-            residual = x[:, -self.q_len:, :]  # (B, q_len, n_embd)
+            residual = x[:, -q_len:, :]  # (B, q_len, n_embd)
         else:  # latent_attn
-            residual = self.c_q.expand(B, -1, -1)  # (B, q_len, n_embd)
+            residual = self.c_q.expand(B, -1, -1)  # (B, latent_q_len, n_embd)
         
         # Apply layer normalization
-        x_norm = self.ln(x)  # (B, T, n_embd)
+        x_norm = self.ln(x)  # (B, kv_len, n_embd)
         
         # Compute queries
         if self.attn_type in ['full_self_attn', 'causal_self_attn', 'cross_attn']:
-            q = self.c_q(x_norm)  # (B, T, n_embd)
-            q_len = T
+            q = self.c_q(x_norm)  # (B, kv_len, n_embd)
+            q_len = kv_len
         elif self.attn_type in ['trunc_self_attn', 'causal_trunc_self_attn']:
-            q = self.c_q(x_norm[:, -self.q_len:, :])  # (B, q_len, n_embd)
-            q_len = self.q_len
+            q = self.c_q(x_norm[:, -q_len:, :])  # (B, q_len, n_embd)
+            # q_len already set from argument
         else:  # latent_attn
-            q = self.c_q.expand(B, -1, -1)  # (B, q_len, n_embd)
-            q_len = self.q_len
+            q = self.c_q.expand(B, -1, -1)  # (B, latent_q_len, n_embd)
+            q_len = self.latent_q_len
         
         # Get k, v source
         if self.attn_type == 'cross_attn':
             kv_source = self.ln(y)  # (B, S, n_embd)
             kv_len = y.size(1)
         else:
-            kv_source = x_norm  # (B, T, n_embd)
-            kv_len = T
+            kv_source = x_norm  # (B, kv_len, n_embd)
+            # kv_len already set from x.size()
         
         # Compute keys and values
         k = self.c_k(kv_source)  # (B, kv_len, n_embd)
@@ -210,12 +213,10 @@ class Attention(nn.Module):
         k = k.view(B, kv_len, self.n_head, self.head_dim)  # (B, kv_len, nh, hd)
         v = v.view(B, kv_len, self.n_head, self.head_dim)  # (B, kv_len, nh, hd)
         
-        # Apply RoPE (only for self_attn modes where q and k share the same sequence)
-        if self.attn_type in ['full_self_attn', 'causal_self_attn']:
-            q = self.apply_rotary_emb(q, rope_start_idx=rope_start_idx)  # (B, q_len, nh, hd)
-            k = self.apply_rotary_emb(k, rope_start_idx=rope_start_idx)  # (B, kv_len, nh, hd)
-        elif self.attn_type in ['trunc_self_attn', 'causal_trunc_self_attn'] and rope_start_idx is not None:
-            q = self.apply_rotary_emb(q, rope_start_idx=rope_start_idx + (T - self.q_len))  # (B, q_len, nh, hd)
+        # Apply RoPE if rope_start_idx is provided
+        # q offset accounts for truncation: when kv_len == q_len, offset is rope_start_idx + 0
+        if rope_start_idx is not None:
+            q = self.apply_rotary_emb(q, rope_start_idx=rope_start_idx + (kv_len - q_len))  # (B, q_len, nh, hd)
             k = self.apply_rotary_emb(k, rope_start_idx=rope_start_idx)  # (B, kv_len, nh, hd)
         
         # Transpose for attention: (B, seq, nh, hd) -> (B, nh, seq, hd)
@@ -226,10 +227,10 @@ class Attention(nn.Module):
         # Build attention mask for causal_trunc_self_attn (custom causal mask for q_len != kv_len)
         attn_mask = None
         if self.attn_type == 'causal_trunc_self_attn':
-            # Query i (actual pos T-q_len+i) attends to keys 0..(T-q_len+i)
-            # Create mask: (q_len, kv_len) where mask[i,j] = True if j <= (T-q_len)+i
-            q_positions = torch.arange(T - self.q_len, T, device=x.device)  # (q_len,)
-            k_positions = torch.arange(T, device=x.device)  # (kv_len,)
+            # Query i (actual pos kv_len-q_len+i) attends to keys 0..(kv_len-q_len+i)
+            # Create mask: (q_len, kv_len) where mask[i,j] = True if j <= (kv_len-q_len)+i
+            q_positions = torch.arange(kv_len - q_len, kv_len, device=x.device)  # (q_len,)
+            k_positions = torch.arange(kv_len, device=x.device)  # (kv_len,)
             attn_mask = k_positions.unsqueeze(0) <= q_positions.unsqueeze(1)  # (q_len, kv_len)
         
         # Scaled dot-product attention (causal masking only for causal_self_attn)
