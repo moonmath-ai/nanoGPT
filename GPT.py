@@ -19,7 +19,7 @@ class GPTConfig:
     vocab_cardinality: int = 99
     n_embd: int = 384
     n_head: int = 6
-    n_layer: int = 6
+    n_layer: int = 8
     has_bias: bool = False
     init_std: float = 0.02
     dropout: float = 0.2
