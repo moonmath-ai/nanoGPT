@@ -20,7 +20,8 @@ class Transformer(nn.Module):
     Can be configured with different attention types:
     - full_self_attn (default): Bidirectional self-attention
     - causal_self_attn: Causal (autoregressive) self-attention
-    - cross_attn: Cross-attention with separate k,v source
+    - cross_attn: Cross-attention, q from y, k/v from x
+    - causal_cross_attn: Causal cross-attention, q from y, k/v from x (requires len(y) <= len(x))
     - trunc_self_attn: Self-attention with truncated queries
     - causal_trunc_self_attn: Causal self-attention with truncated queries
     - latent_attn: Attention with learned latent queries
@@ -38,7 +39,7 @@ class Transformer(nn.Module):
                 - n_head: Number of attention heads
                 - latent_q_len: Query length (for latent_attn mode only, required)
                 - latent_init_std: Standard deviation for latent init (for latent_attn mode only, required)
-            attn_type: Type of attention ('full_self_attn', 'causal_self_attn', 'cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn', or 'latent_attn')
+            attn_type: Type of attention ('full_self_attn', 'causal_self_attn', 'cross_attn', 'causal_cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn', or 'latent_attn')
         """
         super().__init__()
         # Validate required config parameters

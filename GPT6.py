@@ -26,8 +26,8 @@ class GPTConfig:
     q_len: int = None  # Output sequence length (encoder compresses kv_len -> q_len). If None, uses kv_len (no compression).
 
 
-# Architecture: enc (causal_trunc_self_attn) -> blocks (n_layer-1 x causal_self_attn)
-# Bottleneck at start: compresses kv_len -> q_len in first layer, then processes at q_len
+# Architecture: pre_blocks (3 x causal_self_attn) -> enc (causal_trunc_self_attn) -> post_blocks (n_layer-4 x causal_self_attn)
+# Middle bottleneck: 3 layers at full length, compress, then remaining layers at q_len
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -38,8 +38,9 @@ class GPT(nn.Module):
         self.model = nn.ModuleDict(dict(
             v2e = nn.Embedding(config.vocab_cardinality, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            enc = Transformer(config, attn_type='causal_trunc_self_attn'),  # First layer (compresses)
-            blocks = nn.ModuleList([Transformer(config, attn_type='causal_self_attn') for _ in range(config.n_layer - 1)]),  # Remaining layers
+            pre_blocks = nn.ModuleList([Transformer(config, attn_type='causal_self_attn') for _ in range(3)]),
+            enc = Transformer(config, attn_type='causal_trunc_self_attn'),  # compress
+            post_blocks = nn.ModuleList([Transformer(config, attn_type='causal_self_attn') for _ in range(config.n_layer - 4)]),
             ln_o = LayerNorm(config.n_embd, has_bias=config.has_bias),
             e2v = nn.Linear(config.n_embd, config.vocab_cardinality, bias=False),
         ))
@@ -109,14 +110,18 @@ class GPT(nn.Module):
         x = self.model.v2e(input)  # (B, kv_len, n_embd)
         x = self.model.drop(x)  # (B, kv_len, n_embd)
         
+        # Transformer blocks
+        for block in self.model.pre_blocks:
+            x = block(x, rope_start_idx=0)  # (B, kv_len, n_embd)
+
         # Encoder: compresses (B, kv_len, n_embd) -> (B, q_len, n_embd)
         # If q_len is None, use kv_len (no compression)
         # Cap at kv_len for generation when input is shorter than config.q_len
         q_len = min(self.config.q_len, kv_len) if self.config.q_len is not None else kv_len
         x = self.model.enc(x, q_len=q_len, rope_start_idx=0)  # (B, q_len, n_embd)
-        
+
         # Transformer blocks
-        for block in self.model.blocks:
+        for block in self.model.post_blocks:
             x = block(x, rope_start_idx=0)  # (B, q_len, n_embd)
 
         # Output layer
@@ -233,7 +238,7 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)  # (B, vocab_cardinality)
             next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
             
-            # Append to full sequence (not truncated)
+            # Append to sequence
             input = torch.cat((input, next_token), dim=1)  # (B, T+1)
 
         return input

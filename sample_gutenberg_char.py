@@ -2,18 +2,16 @@
 Sample from a trained GPT model on Gutenberg character-level dataset.
 
 Usage:
-    python sample_gutenberg_char.py "Hello world" 100
-    python sample_gutenberg_char.py --input "Hello world" --max_new_tokens 100
-    python sample_gutenberg_char.py --max_new_tokens 200  # Uses empty input
+    python sample_gutenberg_char.py --ckpt out_gutenberg_char/ckpt_GPT_in512_q512.pt "Hello world" 100
+    python sample_gutenberg_char.py -c out_gutenberg_char/ckpt_GPT2X111111_in512_q32.pt "Once upon" 200 -t 0.7
 """
 
 import os
 import argparse
 import pickle
+import importlib
 
 import torch
-
-from GPT import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -28,6 +26,7 @@ seed = None  # Random seed each time by default
 
 def main():
     parser = argparse.ArgumentParser(description='Sample from trained GPT model')
+    parser.add_argument('--ckpt', '-c', required=True, help='Path to checkpoint file')
     parser.add_argument('input', nargs='?', default='', help='Input text to start generation')
     parser.add_argument('max_new_tokens', nargs='?', type=int, default=100, help='Number of tokens to generate')
     parser.add_argument('--input', '-i', dest='input_flag', default=None, help='Input text (alternative)')
@@ -70,17 +69,31 @@ def main():
         return ''.join([itos[t] for t in tokens])
     
     # Load checkpoint
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = args.ckpt
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
     
     print(f"Loading checkpoint from {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=args.device)
     
+    # Dynamically import the correct GPT variant
+    gpt_variant = checkpoint['config'].get('gpt_variant', 'GPT')
+    print(f"Using model: {gpt_variant}")
+    gpt_module = importlib.import_module(gpt_variant)
+    GPTConfig = gpt_module.GPTConfig
+    GPT = gpt_module.GPT
+    
     # Create model
     model_args = checkpoint['model_args']
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+    
+    print(f"number of parameters: {model.get_num_params()/1e6:.2f}M")
+    
+    # Get max_input_len from training config
+    max_input_len = checkpoint['config'].get('input_len', None)
+    if max_input_len:
+        print(f"Using max_input_len={max_input_len} from training config")
     
     # Load state dict
     state_dict = checkpoint['model']
@@ -111,7 +124,7 @@ def main():
     print("-" * 50)
     
     with ctx:
-        output = model.generate(x, max_new_tokens, temperature=args.temperature, top_k=args.top_k)
+        output = model.generate(x, max_new_tokens, temperature=args.temperature, top_k=args.top_k, max_input_len=max_input_len)
     
     # Decode and print
     output_tokens = output[0].tolist()

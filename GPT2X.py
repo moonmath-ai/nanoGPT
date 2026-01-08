@@ -24,10 +24,11 @@ class GPTConfig:
     init_std: float = 0.02
     dropout: float = 0.2
     q_len: int = None  # Output sequence length (encoder compresses kv_len -> q_len). If None, uses kv_len (no compression).
+    block_bmp: int = None  # Bitmap for middle blocks (layers 2..n_layer-1): bit i=1 means causal_cross_attn (K,V from input), bit i=0 means causal_self_attn. None defaults to 0 (all self-attn). Last layer is always causal_self_attn.
 
 
-# Architecture: enc (causal_trunc_self_attn) -> blocks (n_layer-1 x causal_self_attn)
-# Bottleneck at start: compresses kv_len -> q_len in first layer, then processes at q_len
+# Architecture: enc (causal_trunc_self_attn) -> blocks (n_layer-2, type via block_bmp) -> dec (causal_self_attn)
+# Configurable bottleneck: block_bmp bitmap selects causal_cross_attn (bit=1) or causal_self_attn (bit=0) per middle layer
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -35,11 +36,20 @@ class GPT(nn.Module):
         self.config = config
 
         # Build model
+        # block_bmp determines middle block types: bit i=1 -> causal_cross_attn, bit i=0 -> causal_self_attn
+        bmp = config.block_bmp if config.block_bmp is not None else 0
+        num_blocks = config.n_layer - 2  # Middle layers (between enc and dec)
+        blocks = []
+        for i in range(num_blocks):
+            attn_type = 'causal_cross_attn' if (bmp >> i) & 1 else 'causal_self_attn'
+            blocks.append(Transformer(config, attn_type=attn_type))
+        
         self.model = nn.ModuleDict(dict(
             v2e = nn.Embedding(config.vocab_cardinality, config.n_embd),
             drop = nn.Dropout(config.dropout),
             enc = Transformer(config, attn_type='causal_trunc_self_attn'),  # First layer (compresses)
-            blocks = nn.ModuleList([Transformer(config, attn_type='causal_self_attn') for _ in range(config.n_layer - 1)]),  # Remaining layers
+            blocks = nn.ModuleList(blocks),  # Middle layers (type determined by block_bmp)
+            dec = Transformer(config, attn_type='causal_self_attn'),  # Last layer (always self-attn)
             ln_o = LayerNorm(config.n_embd, has_bias=config.has_bias),
             e2v = nn.Linear(config.n_embd, config.vocab_cardinality, bias=False),
         ))
@@ -108,6 +118,7 @@ class GPT(nn.Module):
         # Token embeddings
         x = self.model.v2e(input)  # (B, kv_len, n_embd)
         x = self.model.drop(x)  # (B, kv_len, n_embd)
+        x_persistent = x
         
         # Encoder: compresses (B, kv_len, n_embd) -> (B, q_len, n_embd)
         # If q_len is None, use kv_len (no compression)
@@ -115,9 +126,16 @@ class GPT(nn.Module):
         q_len = min(self.config.q_len, kv_len) if self.config.q_len is not None else kv_len
         x = self.model.enc(x, q_len=q_len, rope_start_idx=0)  # (B, q_len, n_embd)
         
-        # Transformer blocks
-        for block in self.model.blocks:
-            x = block(x, rope_start_idx=0)  # (B, q_len, n_embd)
+        # Middle blocks: causal_cross_attn uses x_persistent for K,V; causal_self_attn uses x only
+        bmp = self.config.block_bmp if self.config.block_bmp is not None else 0
+        for i, block in enumerate(self.model.blocks):
+            if (bmp >> i) & 1:  # causal_cross_attn
+                x = block(x=x_persistent, y=x, rope_start_idx=0)  # (B, q_len, n_embd)
+            else:  # causal_self_attn
+                x = block(x=x, rope_start_idx=0)  # (B, q_len, n_embd)
+        
+        # Decoder: always causal_self_attn
+        x = self.model.dec(x, rope_start_idx=0)  # (B, q_len, n_embd)
 
         # Output layer
         x = self.model.ln_o(x)  # (B, q_len, n_embd)
@@ -233,7 +251,7 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)  # (B, vocab_cardinality)
             next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
             
-            # Append to full sequence (not truncated)
+            # Append to sequence
             input = torch.cat((input, next_token), dim=1)  # (B, T+1)
 
         return input

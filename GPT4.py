@@ -26,8 +26,8 @@ class GPTConfig:
     q_len: int = None  # Output sequence length (encoder compresses kv_len -> q_len). If None, uses kv_len (no compression).
 
 
-# Architecture: enc (causal_trunc_self_attn) -> blocks (n_layer-1 x causal_self_attn)
-# Bottleneck at start: compresses kv_len -> q_len in first layer, then processes at q_len
+# Architecture: blocks (n_layer x causal_cross_attn) with decreasing y slice lengths
+# Progressive funnel via cross-attention: each block cross-attends to x_persistent with shrinking y
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -38,8 +38,7 @@ class GPT(nn.Module):
         self.model = nn.ModuleDict(dict(
             v2e = nn.Embedding(config.vocab_cardinality, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            enc = Transformer(config, attn_type='causal_trunc_self_attn'),  # First layer (compresses)
-            blocks = nn.ModuleList([Transformer(config, attn_type='causal_self_attn') for _ in range(config.n_layer - 1)]),  # Remaining layers
+            blocks = nn.ModuleList([Transformer(config, attn_type='causal_cross_attn') for _ in range(config.n_layer)]),
             ln_o = LayerNorm(config.n_embd, has_bias=config.has_bias),
             e2v = nn.Linear(config.n_embd, config.vocab_cardinality, bias=False),
         ))
@@ -108,16 +107,22 @@ class GPT(nn.Module):
         # Token embeddings
         x = self.model.v2e(input)  # (B, kv_len, n_embd)
         x = self.model.drop(x)  # (B, kv_len, n_embd)
+        x_persistent = x
         
-        # Encoder: compresses (B, kv_len, n_embd) -> (B, q_len, n_embd)
         # If q_len is None, use kv_len (no compression)
         # Cap at kv_len for generation when input is shorter than config.q_len
         q_len = min(self.config.q_len, kv_len) if self.config.q_len is not None else kv_len
-        x = self.model.enc(x, q_len=q_len, rope_start_idx=0)  # (B, q_len, n_embd)
-        
-        # Transformer blocks
-        for block in self.model.blocks:
-            x = block(x, rope_start_idx=0)  # (B, q_len, n_embd)
+
+        # Transformer blocks (funnel: gradually truncate y to compress)
+        # Each block: k,v from x_persistent (fixed), q from y (truncated x)
+        x = self.model.blocks[0](x_persistent, y=x[:, -12*q_len:, :], rope_start_idx=0)  # (B, 12*q_len, n_embd)
+        x = self.model.blocks[1](x_persistent, y=x[:, -8*q_len:, :], rope_start_idx=0)   # (B, 8*q_len, n_embd)
+        x = self.model.blocks[2](x_persistent, y=x[:, -6*q_len:, :], rope_start_idx=0)   # (B, 6*q_len, n_embd)
+        x = self.model.blocks[3](x_persistent, y=x[:, -4*q_len:, :], rope_start_idx=0)   # (B, 4*q_len, n_embd)
+        x = self.model.blocks[4](x_persistent, y=x[:, -3*q_len:, :], rope_start_idx=0)   # (B, 3*q_len, n_embd)
+        x = self.model.blocks[5](x_persistent, y=x[:, -2*q_len:, :], rope_start_idx=0)   # (B, 2*q_len, n_embd)
+        x = self.model.blocks[6](x_persistent, y=x[:, -int(1.5*q_len):, :], rope_start_idx=0)  # (B, 1.5*q_len, n_embd)
+        x = self.model.blocks[7](x_persistent, y=x[:, -q_len:, :], rope_start_idx=0)     # (B, q_len, n_embd)
 
         # Output layer
         x = self.model.ln_o(x)  # (B, q_len, n_embd)
@@ -233,7 +238,7 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)  # (B, vocab_cardinality)
             next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
             
-            # Append to full sequence (not truncated)
+            # Append to sequence
             input = torch.cat((input, next_token), dim=1)  # (B, T+1)
 
         return input

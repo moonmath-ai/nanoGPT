@@ -19,14 +19,15 @@ class Attention(nn.Module):
     Can be configured as:
     - full_self_attn (default): bidirectional, q, k, v are projections of input x, residual is x
     - causal_self_attn: causal (autoregressive), q, k, v are projections of input x, residual is x
-    - cross_attn: bidirectional, q from input x, k, v from y, residual is x
+    - cross_attn: bidirectional, q from y, k, v from x, residual is y
+    - causal_cross_attn: causal, q from y, k, v from x, residual is y (requires len(y) <= len(x))
     - trunc_self_attn: bidirectional, q from last q_len of x, k, v from full x, RoPE applied accordingly
     - causal_trunc_self_attn: causal, q from last q_len of x, k, v from full x, RoPE applied accordingly
     - latent_attn: bidirectional, q is learned latent, k, v from input x, residual is q
     """
     
     # Class-level cache for freqs_cis (always starts from idx=0)
-    _freqs_cis = torch.empty(0)
+    _freqs_cis = torch.empty(0, dtype=torch.complex64)
     
     def __init__(self, config, attn_type: str = 'full_self_attn'):
         """
@@ -40,12 +41,12 @@ class Attention(nn.Module):
                 - dropout: Dropout rate
                 - latent_q_len: Query length (for latent_attn mode only, required)
                 - latent_init_std: Standard deviation for latent init (for latent_attn mode only, required)
-            attn_type: Type of attention ('full_self_attn', 'causal_self_attn', 'cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn', or 'latent_attn')
+            attn_type: Type of attention ('full_self_attn', 'causal_self_attn', 'cross_attn', 'causal_cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn', or 'latent_attn')
         """
         super().__init__()
         # Validate required config parameters
         assert config.n_embd % config.n_head == 0
-        valid_types = ['full_self_attn', 'causal_self_attn', 'cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn', 'latent_attn']
+        valid_types = ['full_self_attn', 'causal_self_attn', 'cross_attn', 'causal_cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn', 'latent_attn']
         assert attn_type in valid_types, f"attn_type must be one of {valid_types}, got {attn_type}"
         
         self.attn_type = attn_type
@@ -54,7 +55,7 @@ class Attention(nn.Module):
         self.ln = LayerNorm(config.n_embd, has_bias=config.has_bias)
         
         # Query projection or learned latent
-        if attn_type in ['full_self_attn', 'causal_self_attn', 'cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn']:
+        if attn_type in ['full_self_attn', 'causal_self_attn', 'cross_attn', 'causal_cross_attn', 'trunc_self_attn', 'causal_trunc_self_attn']:
             self.c_q = nn.Linear(config.n_embd, config.n_embd, bias=config.has_bias)
         else:  # latent_attn
             assert hasattr(config, 'latent_q_len'), "config must have 'latent_q_len' for latent_attn mode"
@@ -151,23 +152,26 @@ class Attention(nn.Module):
         Args:
             x: (B, T, n_embd) input tensor
                 - For full/causal_self_attn: used for q, k, v
-                - For cross_attn: used for q only
+                - For cross_attn/causal_cross_attn: used for k, v only
                 - For trunc_self_attn/causal_trunc_self_attn: last q_len positions used for q, full x for k, v
                 - For latent_attn: used for k, v only
             q_len: Output length for trunc_self_attn/causal_trunc_self_attn (required for those modes)
-            y: (B, S, n_embd) tensor for cross_attn (k, v source), required for cross_attn
+            y: (B, S, n_embd) tensor for cross_attn/causal_cross_attn (q source)
             rope_start_idx: Starting position index for RoPE (default None, skips RoPE if None)
             
         Returns:
-            Output tensor: (B, T, n_embd) for full/causal_self_attn and cross_attn, (B, q_len, n_embd) for trunc_self_attn, causal_trunc_self_attn, and latent_attn
+            Output tensor: (B, T, n_embd) for full/causal_self_attn; (B, q_len, n_embd) for cross_attn, causal_cross_attn, trunc_self_attn, causal_trunc_self_attn, and latent_attn
         """
         B, kv_len, n_embd = x.size()  # batch, sequence length, embedding dim
         assert n_embd == self.n_embd, "Input embedding dimension must match model dimension"
         
-        # Validate y for cross_attn
-        if self.attn_type == 'cross_attn':
-            assert y is not None, "y is required for cross_attn mode"
+        # Validate y for cross_attn and causal_cross_attn
+        if self.attn_type in ['cross_attn', 'causal_cross_attn']:
+            assert y is not None, "y is required for cross_attn/causal_cross_attn mode"
             assert y.size(2) == self.n_embd, "y embedding dimension must match model dimension"
+            q_len = y.size(1)  # q comes from y
+            if self.attn_type == 'causal_cross_attn':
+                assert q_len <= kv_len, f"causal_cross_attn requires len(y) ({q_len}) <= len(x) ({kv_len})"
         
         # Validate q_len for trunc modes
         if self.attn_type in ['trunc_self_attn', 'causal_trunc_self_attn']:
@@ -175,8 +179,10 @@ class Attention(nn.Module):
             assert q_len <= kv_len, f"q_len ({q_len}) must be <= kv_len ({kv_len})"
         
         # Store residual for pre-norm architecture
-        if self.attn_type in ['full_self_attn', 'causal_self_attn', 'cross_attn']:
+        if self.attn_type in ['full_self_attn', 'causal_self_attn']:
             residual = x  # (B, kv_len, n_embd)
+        elif self.attn_type in ['cross_attn', 'causal_cross_attn']:
+            residual = y  # (B, q_len, n_embd)
         elif self.attn_type in ['trunc_self_attn', 'causal_trunc_self_attn']:
             residual = x[:, -q_len:, :]  # (B, q_len, n_embd)
         else:  # latent_attn
@@ -186,9 +192,12 @@ class Attention(nn.Module):
         x_norm = self.ln(x)  # (B, kv_len, n_embd)
         
         # Compute queries
-        if self.attn_type in ['full_self_attn', 'causal_self_attn', 'cross_attn']:
+        if self.attn_type in ['full_self_attn', 'causal_self_attn']:
             q = self.c_q(x_norm)  # (B, kv_len, n_embd)
             q_len = kv_len
+        elif self.attn_type in ['cross_attn', 'causal_cross_attn']:
+            q = self.c_q(self.ln(y))  # (B, q_len, n_embd)
+            # q_len already set from y.size(1)
         elif self.attn_type in ['trunc_self_attn', 'causal_trunc_self_attn']:
             q = self.c_q(x_norm[:, -q_len:, :])  # (B, q_len, n_embd)
             # q_len already set from argument
@@ -197,9 +206,9 @@ class Attention(nn.Module):
             q_len = self.latent_q_len
         
         # Get k, v source
-        if self.attn_type == 'cross_attn':
-            kv_source = self.ln(y)  # (B, S, n_embd)
-            kv_len = y.size(1)
+        if self.attn_type in ['cross_attn', 'causal_cross_attn']:
+            kv_source = x_norm  # (B, kv_len, n_embd) - k, v from x
+            # kv_len already set from x.size()
         else:
             kv_source = x_norm  # (B, kv_len, n_embd)
             # kv_len already set from x.size()
@@ -224,16 +233,16 @@ class Attention(nn.Module):
         k = k.transpose(1, 2)  # (B, nh, kv_len, hd)
         v = v.transpose(1, 2)  # (B, nh, kv_len, hd)
         
-        # Build attention mask for causal_trunc_self_attn (custom causal mask for q_len != kv_len)
+        # Build attention mask for causal modes with q_len != kv_len
+        # Queries are aligned with END of kv sequence: query i corresponds to position (kv_len-q_len+i)
         attn_mask = None
-        if self.attn_type == 'causal_trunc_self_attn':
-            # Query i (actual pos kv_len-q_len+i) attends to keys 0..(kv_len-q_len+i)
+        if self.attn_type in ['causal_trunc_self_attn', 'causal_cross_attn']:
             # Create mask: (q_len, kv_len) where mask[i,j] = True if j <= (kv_len-q_len)+i
             q_positions = torch.arange(kv_len - q_len, kv_len, device=x.device)  # (q_len,)
             k_positions = torch.arange(kv_len, device=x.device)  # (kv_len,)
             attn_mask = k_positions.unsqueeze(0) <= q_positions.unsqueeze(1)  # (q_len, kv_len)
         
-        # Scaled dot-product attention (causal masking only for causal_self_attn)
+        # Scaled dot-product attention (is_causal only for causal_self_attn; others use attn_mask)
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,

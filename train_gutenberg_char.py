@@ -21,14 +21,21 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from GPT import GPTConfig, GPT
+# gpt_variant = 'GPT'  # Must match the import below
+# from GPT import GPTConfig, GPT  # encoder -> self-attention
+# gpt_variant = 'GPT1'
+# from GPT1 import GPTConfig, GPT  # encoder -> cross-attention with encoder's output
+# gpt_variant = 'GPT2'
+# from GPT2 import GPTConfig, GPT  # encoder -> cross-attention with encoder's input
+gpt_variant = 'GPT2X'
+from GPT2X import GPTConfig, GPT  # encoder -> cross-attention with encoder's input or self-attention -> decoder
 
 # -----------------------------------------------------------------------------
 # Training parameters
 dataset = 'gutenberg_char'
 gradient_accumulation_steps = 1
 batch_size = 64
-input_len = 32  # Input sequence length
+input_len = 512  # Input sequence length
 loss_last_only = False  # If True, compute loss only on the last token position
 
 # Model parameters
@@ -40,6 +47,7 @@ has_bias = False
 init_std = 0.02
 q_len = 32  # If None, uses input_len (no compression)
 assert q_len is None or q_len <= input_len, f"q_len ({q_len}) must be <= input_len ({input_len})"
+block_bmp = 63
 
 # I/O
 out_dir = 'out_gutenberg_char'
@@ -48,14 +56,14 @@ eval_iters = 200
 eval_only = False
 log_interval = 10
 always_save_checkpoint = False
-init_from = 'scratch'  # 'scratch' or 'resume'
+init_from = 'scratch'  # 'scratch' or 'auto' (find latest matching checkpoint)
 wandb_log = True
 wandb_project = 'gutenberg-char'
-wandb_run_name = f'gpt-gutenberg-char-{input_len}to{q_len}'
+wandb_run_name = f'{gpt_variant}-gutenberg-char-in{input_len}-q{q_len}'
 
 # AdamW optimizer
 learning_rate = 1e-3
-max_iters = 100000
+max_iters = 1000000
 lr_decay_iters = max_iters
 min_lr = 1e-4
 weight_decay = 1e-1
@@ -64,6 +72,11 @@ beta2 = 0.99
 grad_clip = 1.0
 decay_lr = True
 warmup_iters = 100
+# # Adjusted params
+# learning_rate = 1e-3
+# min_lr = 1e-5  # 100x lower for finer tuning
+# warmup_iters = max(100, int(0.03 * max_iters))  # 3% warmup
+# lr_decay_iters = int(0.9 * max_iters)  # start decay at 10%, end at 90%
 
 # DDP settings
 backend = 'nccl'
@@ -177,15 +190,34 @@ model_args = dict(
     init_std=init_std,
     dropout=dropout,
     q_len=q_len,
+    block_bmp=block_bmp,
 )
+
+def get_checkpoint_path():
+    """Get checkpoint path for current config (gpt_variant, input_len, q_len)."""
+    return os.path.join(out_dir, f'ckpt_{gpt_variant}_in{input_len}_q{q_len}.pt')
+
+# Model initialization
+wandb_run_id = None  # For resuming wandb runs
+first_eval = True  # Skip first wandb log (only print to screen)
+
+if init_from == 'auto':
+    # Check if checkpoint exists for current config
+    ckpt_path = get_checkpoint_path()
+    if os.path.exists(ckpt_path):
+        init_from = 'resume'
+        print(f"Auto-resuming from {ckpt_path}")
+    else:
+        init_from = 'scratch'
+        print("No matching checkpoint found, starting from scratch")
 
 if init_from == 'scratch':
     print("Initializing a new model from scratch")
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    # Only reached via 'auto' which sets ckpt_path
+    print(f"Resuming training from {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # Force config attributes to match checkpoint
@@ -202,6 +234,8 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+    # Get wandb run ID for resuming
+    wandb_run_id = checkpoint.get('wandb_run_id', None)
 
 model.to(device)
 
@@ -267,7 +301,19 @@ def get_lr(it):
 # Logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    if wandb_run_id:
+        # Try to resume existing run, fall back to new run if it doesn't exist
+        print(f"Trying to resume wandb run {wandb_run_id}")
+        try:
+            wandb.init(project=wandb_project, id=wandb_run_id, resume="must", config=config)
+        except wandb.errors.UsageError:
+            print(f"Wandb run {wandb_run_id} not found, starting new run")
+            wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+            wandb_run_id = wandb.run.id
+    else:
+        # Start new run
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+        wandb_run_id = wandb.run.id
 
 # -----------------------------------------------------------------------------
 
@@ -288,13 +334,14 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: val loss {losses['val']:.4f}")
-        if wandb_log:
+        if wandb_log and not first_eval:
             wandb.log({
                 "iter": iter_num,
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu * 100,
             })
+        first_eval = False
         # Check for improvement
         if losses['val'] < best_val_loss:
             best_val_loss = losses['val']
@@ -307,9 +354,11 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
+                    'wandb_run_id': wandb_run_id,
                 }
-                print(f"Saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                ckpt_path = get_checkpoint_path()
+                print(f"Saving checkpoint to {ckpt_path} (iter {iter_num})")
+                torch.save(checkpoint, ckpt_path)
         else:
             val_loss_no_improve_count += 1
             # if val_loss_no_improve_count >= early_stop_patience:
@@ -325,9 +374,11 @@ while True:
                 'iter_num': iter_num,
                 'best_val_loss': best_val_loss,
                 'config': config,
+                'wandb_run_id': wandb_run_id,
             }
-            print(f"Saving checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            ckpt_path = get_checkpoint_path()
+            print(f"Saving checkpoint to {ckpt_path} (iter {iter_num})")
+            torch.save(checkpoint, ckpt_path)
     
     if iter_num == 0 and eval_only:
         break
