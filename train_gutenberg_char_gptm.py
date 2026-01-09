@@ -18,6 +18,8 @@ Usage:
     python train_gutenberg_char_gptm.py --teacher_ckpt out_gutenberg_char/ckpt_GPT2X111111_in512_q32.pt
 """
 
+# Multi-step training: train on rollouts to reduce error propagation in feedback loops
+
 import os
 import time
 import math
@@ -49,12 +51,19 @@ init_std = 0.02
 state_loss_type = 'mse'  # 'mse', 'contrastive', 'cosine', 'kl_div'
 state_loss_weight = 1.0  # Weight for state loss (static)
 ce_weight_max = 0.1      # Maximum weight for CE loss (dynamic, ramps up)
-ce_warmup_iters = 10000  # Iterations to ramp CE weight from 0 to ce_weight_max
+ce_delay_iters = 0   # Iterations with CE weight = 0 (state-only training)
+ce_warmup_iters = 10000  # Iterations to ramp CE weight from 0 to ce_weight_max (after delay)
 contrastive_temp = 0.1   # Temperature for contrastive loss
 kl_div_temp = 1.0        # Temperature for KL divergence (softmax temperature)
 
 # Regularization
-state_dither_std = 0.01  # Gaussian noise std added to s_x (0 = disabled)
+state_dither_std = 0.07  # Gaussian noise std added to s_x (0 = disabled)
+
+# Residual state prediction (reduces error propagation)
+use_residual_state = False  # If True, predict Δs instead of s_y, then s_next = s_x + Δs
+
+# Multi-step training (rollouts)
+rollout_steps = 3  # Number of chained predictions (1 = single-step, no rollout)
 
 # I/O
 out_dir = 'out_gutenberg_char'
@@ -92,7 +101,8 @@ def main():
     args = parser.parse_args()
     
     # Sanity checks
-    assert max_iters >= ce_warmup_iters, f"max_iters ({max_iters}) must be >= ce_warmup_iters ({ce_warmup_iters})"
+    ce_total_iters = ce_delay_iters + ce_warmup_iters
+    assert max_iters >= ce_total_iters, f"max_iters ({max_iters}) must be >= ce_delay_iters + ce_warmup_iters ({ce_total_iters})"
     
     # Check input_len matches teacher (after loading checkpoint)
     def check_input_len(teacher_ckpt):
@@ -188,18 +198,25 @@ def main():
         meta = pickle.load(f)
     assert vocab_cardinality == meta['vocab_size'], "Vocab size mismatch"
     
-    def get_batch():
-        max_start = data_len - input_len - 1
+    def get_batch(num_steps=1):
+        """Get batch of sequences. For rollouts, returns num_steps+1 consecutive sequences."""
+        # Need input_len + num_steps tokens total
+        seq_len_needed = input_len + num_steps
+        max_start = data_len - seq_len_needed
         ix = torch.randint(0, max_start, (batch_size,))
-        x = torch.stack([torch.from_numpy(data[i:i + input_len].astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy(data[i + 1:i + 1 + input_len].astype(np.int64)) for i in ix])
-        if device_type == 'cuda':
-            x = x.pin_memory().to(device, non_blocking=True)
-            y = y.pin_memory().to(device, non_blocking=True)
-        else:
-            x = x.to(device)
-            y = y.to(device)
-        return x, y
+        
+        # Return list of sequences: [seq_0, seq_1, ..., seq_num_steps]
+        # seq_i starts at position i, each has length input_len
+        sequences = []
+        for step in range(num_steps + 1):
+            seq = torch.stack([torch.from_numpy(data[i + step:i + step + input_len].astype(np.int64)) for i in ix])
+            if device_type == 'cuda':
+                seq = seq.pin_memory().to(device, non_blocking=True)
+            else:
+                seq = seq.to(device)
+            sequences.append(seq)
+        
+        return sequences  # List of (B, input_len) tensors
     
     # -------------------------------------------------------------------------
     # Create GPTM model
@@ -343,12 +360,15 @@ def main():
         return captured_hidden['last_input']  # (B, q_len, n_embd)
     
     def get_ce_weight(it):
-        """Dynamic CE weight: ramps from 0 to ce_weight_max over ce_warmup_iters."""
-        if it >= ce_warmup_iters:
+        """Dynamic CE weight: 0 for ce_delay_iters, then ramps to ce_weight_max over ce_warmup_iters."""
+        if it < ce_delay_iters:
+            return 0.0  # State-only training phase
+        adjusted_it = it - ce_delay_iters
+        if adjusted_it >= ce_warmup_iters:
             return ce_weight_max
-        return ce_weight_max * (it / ce_warmup_iters)
+        return ce_weight_max * (adjusted_it / ce_warmup_iters)
     
-    def forward_gptm(input_emb, target_emb, target_tokens, ce_weight):
+    def forward_gptm(input_emb, target_emb, target_tokens, ce_weight, input_state=None):
         """
         Forward pass through GPTM with embedding input.
         
@@ -357,6 +377,7 @@ def main():
             target_emb: (B, q_len+1, n_embd) - [s_y, embed(y[-1])]
             target_tokens: (B,) - y[-1] token indices for cross-entropy
             ce_weight: current CE weight (dynamic)
+            input_state: (B, q_len, n_embd) - s_x, needed for residual mode
             
         Returns:
             loss: combined state loss + CE loss
@@ -376,7 +397,15 @@ def main():
         x = gptm.model.ln_o(x)
         
         # State loss on hidden states (positions 0..q_len-1)
-        state_loss = compute_state_loss(x[:, :-1, :], target_emb[:, :-1, :])
+        pred_state = x[:, :-1, :]
+        target_state = target_emb[:, :-1, :]
+        
+        if use_residual_state:
+            # Residual mode: model predicts Δs, target is (s_y - s_x)
+            assert input_state is not None, "input_state required for residual mode"
+            target_state = target_state - input_state  # Δs = s_y - s_x
+        
+        state_loss = compute_state_loss(pred_state, target_state)
         
         # Cross-entropy loss on last position (predicting next token)
         logits_last = gptm.model.e2v(x[:, -1, :])  # (B, vocab)
@@ -387,13 +416,102 @@ def main():
         
         return loss, state_loss.item(), ce_loss.item()
     
+    def forward_gptm_single(input_emb):
+        """
+        Single forward pass through GPTM, returns output embeddings (no loss computation).
+        Used for rollout chaining where gradients must flow through.
+        
+        Args:
+            input_emb: (B, q_len+1, n_embd) - [s_current, embed(last_token)]
+            
+        Returns:
+            output_emb: (B, q_len+1, n_embd) - [s_next (or Δs), logits_emb]
+        """
+        x = gptm.model.drop(input_emb)
+        for block in gptm.model.blocks:
+            x = block(x, rope_start_idx=0)
+        x = gptm.model.ln_o(x)
+        return x
+    
+    def forward_rollout(sequences, ce_weight):
+        """
+        Multi-step rollout training.
+        
+        Args:
+            sequences: list of (B, input_len) token tensors, length = rollout_steps + 1
+            ce_weight: current CE weight
+            
+        Returns:
+            loss: total loss across all rollout steps
+            avg_state_loss: average state loss for logging
+            avg_ce_loss: average CE loss for logging
+        """
+        num_steps = len(sequences) - 1
+        
+        # Get all teacher hidden states upfront
+        with torch.no_grad():
+            teacher_states = [get_teacher_hidden(seq) for seq in sequences]  # List of (B, q_len, n_embd)
+            # Get all last token embeddings
+            last_token_embs = [teacher.model.v2e(seq[:, -1:]) for seq in sequences]  # List of (B, 1, n_embd)
+        
+        total_state_loss = 0.0
+        total_ce_loss = 0.0
+        
+        # Start from true teacher state (with optional dither)
+        s_current = teacher_states[0]
+        if state_dither_std > 0:
+            s_current = s_current + torch.randn_like(s_current) * state_dither_std
+        
+        for step in range(num_steps):
+            # Build input: [s_current, embed(last_token)]
+            input_emb = torch.cat([s_current, last_token_embs[step]], dim=1)  # (B, q_len+1, n_embd)
+            
+            # Forward through GPTM (gradients flow through)
+            output_emb = forward_gptm_single(input_emb)  # (B, q_len+1, n_embd)
+            
+            # Predicted state (positions 0..q_len-1)
+            pred_state = output_emb[:, :-1, :]  # (B, q_len, n_embd)
+            
+            # Target state
+            target_state = teacher_states[step + 1]  # (B, q_len, n_embd)
+            
+            if use_residual_state:
+                # In residual mode: pred_state is Δs, target is (s_next - s_current)
+                # But s_current might be predicted (not teacher), so we compare to true delta
+                target_delta = target_state - teacher_states[step]  # True Δs from teacher
+                state_loss = compute_state_loss(pred_state, target_delta)
+                # Update s_current by adding predicted delta
+                s_current = s_current + pred_state  # s_next = s_current + Δs
+            else:
+                # Direct mode: pred_state is s_next
+                state_loss = compute_state_loss(pred_state, target_state)
+                s_current = pred_state  # Use predicted state for next step
+            
+            total_state_loss = total_state_loss + state_loss
+            
+            # CE loss on last position (predicting next token)
+            logits_last = gptm.model.e2v(output_emb[:, -1, :])  # (B, vocab)
+            target_tokens = sequences[step + 1][:, -1]  # (B,) - next sequence's last token
+            ce_loss = F.cross_entropy(logits_last, target_tokens)
+            total_ce_loss = total_ce_loss + ce_loss
+        
+        # Average losses over steps
+        avg_state_loss = total_state_loss / num_steps
+        avg_ce_loss = total_ce_loss / num_steps
+        
+        # Combined loss
+        loss = state_loss_weight * avg_state_loss + ce_weight * avg_ce_loss
+        
+        return loss, avg_state_loss.item(), avg_ce_loss.item()
+    
     @torch.no_grad()
     def estimate_loss():
         """Estimate validation loss (CE only on predicted character)."""
         gptm.eval()
         ce_losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            x, y = get_batch()
+            sequences = get_batch(num_steps=1)  # [x, y]
+            x, y = sequences[0], sequences[1]
             
             # Get teacher hidden states
             s_x = get_teacher_hidden(x)  # (B, q_len, n_embd)
@@ -444,18 +562,25 @@ def main():
         'state_loss_type': state_loss_type,
         'state_loss_weight': state_loss_weight,
         'ce_weight_max': ce_weight_max,
+        'ce_delay_iters': ce_delay_iters,
         'ce_warmup_iters': ce_warmup_iters,
         'contrastive_temp': contrastive_temp,
         'kl_div_temp': kl_div_temp,
         'state_dither_std': state_dither_std,
+        'use_residual_state': use_residual_state,
+        'rollout_steps': rollout_steps,
         'learning_rate': learning_rate,
         'max_iters': max_iters,
     }
     
     print(f"State loss: {state_loss_type} (weight={state_loss_weight})")
-    print(f"CE weight: 0 → {ce_weight_max} over {ce_warmup_iters} iters (dynamic)")
+    print(f"CE weight: 0 for {ce_delay_iters} iters, then 0 → {ce_weight_max} over {ce_warmup_iters} iters")
     if state_dither_std > 0:
         print(f"State dither: std={state_dither_std}")
+    if use_residual_state:
+        print(f"Residual state prediction: ENABLED (model predicts Δs)")
+    if rollout_steps > 1:
+        print(f"Multi-step training: {rollout_steps} rollout steps")
     
     if wandb_log:
         import wandb
@@ -513,34 +638,46 @@ def main():
         if iter_num == 0 and eval_only:
             break
         
-        # Get batch
-        x, y = get_batch()
-        
-        # Get teacher hidden states
-        s_x = get_teacher_hidden(x)  # (B, q_len, n_embd)
-        s_y = get_teacher_hidden(y)  # (B, q_len, n_embd)
-        
-        # Add dither to input state (regularization, training only)
-        if state_dither_std > 0:
-            s_x = s_x + torch.randn_like(s_x) * state_dither_std
-        
-        # Get embeddings for last tokens (use teacher's embedding layer)
-        with torch.no_grad():
-            embed_x_last = teacher.model.v2e(x[:, -1:])  # (B, 1, n_embd)
-            embed_y_last = teacher.model.v2e(y[:, -1:])  # (B, 1, n_embd)
-        
-        # Concatenate inputs
-        input_emb = torch.cat([s_x, embed_x_last], dim=1)   # (B, q_len+1, n_embd)
-        target_emb = torch.cat([s_y, embed_y_last], dim=1)  # (B, q_len+1, n_embd)
-        target_tokens = y[:, -1]  # (B,)
-        
         # Get current CE weight (dynamic)
         ce_weight = get_ce_weight(iter_num)
         
-        # Forward/backward
-        with ctx:
-            loss, state_loss_val, ce_loss_val = forward_gptm(input_emb, target_emb, target_tokens, ce_weight)
-            loss = loss / gradient_accumulation_steps
+        # Get batch and compute loss
+        if rollout_steps > 1:
+            # Multi-step rollout training
+            sequences = get_batch(num_steps=rollout_steps)
+            with ctx:
+                loss, state_loss_val, ce_loss_val = forward_rollout(sequences, ce_weight)
+                loss = loss / gradient_accumulation_steps
+        else:
+            # Single-step training (original behavior)
+            sequences = get_batch(num_steps=1)
+            x, y = sequences[0], sequences[1]
+            
+            # Get teacher hidden states
+            s_x = get_teacher_hidden(x)  # (B, q_len, n_embd)
+            s_y = get_teacher_hidden(y)  # (B, q_len, n_embd)
+            
+            # Add dither to input state (regularization, training only)
+            if state_dither_std > 0:
+                s_x = s_x + torch.randn_like(s_x) * state_dither_std
+            
+            # Get embeddings for last tokens (use teacher's embedding layer)
+            with torch.no_grad():
+                embed_x_last = teacher.model.v2e(x[:, -1:])  # (B, 1, n_embd)
+                embed_y_last = teacher.model.v2e(y[:, -1:])  # (B, 1, n_embd)
+            
+            # Concatenate inputs
+            input_emb = torch.cat([s_x, embed_x_last], dim=1)   # (B, q_len+1, n_embd)
+            target_emb = torch.cat([s_y, embed_y_last], dim=1)  # (B, q_len+1, n_embd)
+            target_tokens = y[:, -1]  # (B,)
+            
+            # Forward/backward
+            with ctx:
+                loss, state_loss_val, ce_loss_val = forward_gptm(
+                    input_emb, target_emb, target_tokens, ce_weight, 
+                    input_state=s_x if use_residual_state else None
+                )
+                loss = loss / gradient_accumulation_steps
         
         scaler.scale(loss).backward()
         
